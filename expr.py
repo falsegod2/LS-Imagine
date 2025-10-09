@@ -188,14 +188,16 @@ def main(config): # config is namespace
     if config.deterministic_run:
         tools.enable_deterministic_run()
 
-    logdir = pathlib.Path(config.logdir).expanduser() 
-    logdir = logdir / config.task
-    logdir = logdir / 'seed_{}'.format(config.seed)
+    #logdir = pathlib.Path(config.logdir).expanduser() 
+    #logdir = logdir / config.task
+    #logdir = logdir / 'seed_{}'.format(config.seed)
+    logdir = "/content/LS-Imagine/logdir/minedojo_harvest_log_in_plains/seed_0/20250911T054926"
+    logdir = pathlib.Path(logdir).expanduser() 
     timestamp = datetime.now().strftime('%Y%m%dT%H%M%S')
-    logdir = logdir / timestamp
+    #logdir = logdir / timestamp
     config.logdir = logdir
-    config.traindir = config.traindir or logdir / "train_eps"
-    config.evaldir = config.evaldir or logdir / "eval_eps"
+    config.traindir = logdir / "train_eps"
+    config.evaldir = logdir / "eval_eps"
     config.steps //= config.action_repeat
     config.eval_every //= config.action_repeat 
     config.log_every //= config.action_repeat 
@@ -204,6 +206,7 @@ def main(config): # config is namespace
     config.traindir.mkdir(parents=True, exist_ok=True)
     config.evaldir.mkdir(parents=True, exist_ok=True)
     step = count_steps(config.traindir)
+
     
     logger = tools.Logger(config, logdir, config.action_repeat * step)
 
