@@ -471,7 +471,7 @@ def save_episodes(directory, episodes):
     return True
 
 def replace_none_with_zeros(episode):
-    if "image" in episode and episode["image"]:
+    if "image" in episode:
         reference_shape = episode["image"][0].shape
     else:
         raise ValueError("Image data is missing or malformed in episode.")
@@ -481,7 +481,7 @@ def replace_none_with_zeros(episode):
             np.zeros(reference_shape) if img is None else img for img in episode["zoomed_image"]
         ]
     
-    if "heatmap" in episode and episode["heatmap"]:
+    if "heatmap" in episode:
         heatmap_shape = episode["heatmap"][0].shape
     else:
         heatmap_shape = None
@@ -492,6 +492,7 @@ def replace_none_with_zeros(episode):
         ]
     
     return episode
+
 
 def from_generator(generator, batch_size):
 
