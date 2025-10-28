@@ -477,6 +477,7 @@ class ImagBehavior(nn.Module):
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
         else:
             feat_size = config.dyn_stoch + config.dyn_deter
+        #actor网络
         self.actor = networks.MLP(
             feat_size,
             (config.num_actions,),
@@ -494,6 +495,7 @@ class ImagBehavior(nn.Module):
             outscale=config.actor["outscale"],
             name="Actor",
         )
+        #critic网络
         self.value = networks.MLP(
             feat_size,
             (255,) if config.critic["dist"] == "symlog_disc" else (),
@@ -548,6 +550,7 @@ class ImagBehavior(nn.Module):
         jump_indicator,
         is_end,
     ):
+        #LS_Imagine的_train中几个 lambda 函数作为参数传递进该函数
 
         self._update_slow_target()
         metrics = {}
@@ -555,6 +558,7 @@ class ImagBehavior(nn.Module):
         with tools.RequiresGrad(self.actor):
             with torch.cuda.amp.autocast(self._use_amp):
                 # add post-jump state to start
+                #将start的时间维 T 和批维 B展平，
                 flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
                 start = {k: flatten(v) for k, v in start.items()} # [512, xx, xx]
                 if start_zoomed is not None and self.jump_prob > 0.0:
@@ -574,7 +578,24 @@ class ImagBehavior(nn.Module):
                 jump_record = torch.empty((0, state_num), device=self._config.device) # [0, N]
                 imag_action = torch.empty((0, state_num, action_dimension), device=self._config.device) # [0, N, xx]
 
-                for _ in range (self._config.imag_horizon - 1):
+
+########
+                # === [新增] 统一最大想象步数 & 每条轨迹的“有效长度” ===
+                L_max = self._config.imag_horizon              # 不改 rollouts 次数，只加遮罩
+                hmin = getattr(self._config, "imag_hmin", 5)   # 可加到配置里
+                hmax = getattr(self._config, "imag_hmax", L_max)
+
+                # 占位规则：先全给 L_max，先跑通再换成你的动态规则
+                lengths = torch.full((state_num,), L_max, device=self._config.device, dtype=torch.long)  # [N]
+
+                # 生成时间步掩码 mask: [L_max, N, 1]
+                steps = torch.arange(L_max, device=self._config.device)[:, None]      # [L_max, 1]
+                mask  = (steps < lengths[None, :]).float().unsqueeze(-1)              # [L_max, N, 1]
+
+
+                #对想象视野进行动态化？
+                #for _ in range (self._config.imag_horizon - 1):
+                for _ in range (L_max - 1):
                     checking_state = {} # [N, xx, xx]
                     for key, tensor in imag_state.items():
                         checking_state[key] = tensor[-1, :, ...]
@@ -590,6 +611,7 @@ class ImagBehavior(nn.Module):
                         jump_state[key] = tensor[indices]
 
                     # for states identified as requiring a jumpy transition, execute long-term imagination.
+                    #识别到跳跃指示，执行长期跳跃分支
                     _, state_after_jumping, _ = self._jumpy(
                         jump_state, self.actor, 1
                     )
@@ -598,7 +620,7 @@ class ImagBehavior(nn.Module):
                         state_after_jumping, self.actor, 1
                     ) # [X, xx, xx]
 
-                    # For other states, execute short-term imagination.
+                    # 对于其他状态，执行短期分支
                     _, state_after_imagination, ac = self._imagine(
                         checking_state, self.actor, 1
                     ) # [N, xx, xx]
@@ -639,7 +661,7 @@ class ImagBehavior(nn.Module):
                 for key, tensor in imag_state.items():
                     new_state[key] = tensor[zoom_indices] # [Y, xx, xx]
 
-                _, new_state_after_jump, _ = self._jumpy(
+                _, new_state_after_jump, _ = self._dynamic_jump_imagine(
                     new_state, self.actor, 1
                 ) 
 
@@ -647,11 +669,22 @@ class ImagBehavior(nn.Module):
                     new_state_after_jump, self.actor, 1
                 ) 
 
+                #想象长度
+                #new_feat, new_state_sequence, new_action = self._imagine(new_state_after_jump, self.actor, self._config.imag_horizon) # [L, N, xx, xx]
                 new_feat, new_state_sequence, new_action = self._imagine(
-                    new_state_after_jump, self.actor, self._config.imag_horizon
-                ) # [L, N, xx, xx]
+                    new_state_after_jump, self.actor, L_max
+                )
 
-                new_jump_record = torch.zeros((self._config.imag_horizon, new_num), device=self._config.device) # [L, Y]
+                #记录张量形状
+                #new_jump_record = torch.zeros((self._config.imag_horizon, new_num), device=self._config.device) # [L, Y]
+                new_jump_record = torch.zeros((L_max, new_num), device=self._config.device)
+
+                #给新追加的 Y=new_num 条轨迹也做一个 mask 并拼上去（否则第二维从 N 变 N+Y 后，mask 不匹配）
+                new_lengths = torch.full((new_num,), L_max, device=self._config.device, dtype=torch.long)  # 先用 L_max
+                new_mask    = (steps < new_lengths[None, :]).float().unsqueeze(-1)   # [L_max, Y, 1]
+                mask        = torch.cat((mask, new_mask), dim=1)                     # [L_max, N+Y, 1]
+
+
 
                 for key, tensor in imag_state.items():
                     imag_state[key] = torch.cat((tensor, new_state_sequence[key]), dim=1) # [L, N+Y, xx, xx]
@@ -662,23 +695,33 @@ class ImagBehavior(nn.Module):
 
                 imagination_num_tensor = torch.tensor(state_num, dtype=torch.float32, device=imag_feat.device)
                 
+                '''
                 reward = objective(imag_feat, imag_state, imag_action)
-                
                 intrinsic_reward = intrinsic_objective(imag_feat, imag_state, imag_action)
                 reward += intrinsic_reward
-
-
                 actor_ent = self.actor(imag_feat).entropy() 
                 state_ent = self._world_model.dynamics.get_dist(imag_state).entropy()
+                '''
+                reward = objective(imag_feat, imag_state, imag_action)
+                reward = reward * mask
+                intrinsic_reward = intrinsic_reward * mask
+                reward = reward + intrinsic_reward
+
+                actor_ent = self.actor(imag_feat).entropy() * mask
+                state_ent = self._world_model.dynamics.get_dist(imag_state).entropy() * mask
+
 
                 jump_sequence_record = torch.any(jump_record, dim=0, keepdim=True).repeat(jump_record.size(0), 1) # [L, N]
                 jump_record_tensor = jump_record.unsqueeze(-1) # [L, N, 1]
                 jump_sequence_record = jump_sequence_record.unsqueeze(-1) # [L, N, 1]
 
                 target, weights, base = self._compute_target(
-                    imag_feat, imag_state, reward, jump_record_tensor, jumping_steps_predictor, accumulated_reward_predictor, is_end
+                    imag_feat, imag_state, reward, jump_record_tensor, jumping_steps_predictor, accumulated_reward_predictor, is_end, 
+                    mask, lengths
                 )
 
+
+                '''
                 actor_loss, mets = self._compute_actor_loss(
                     imag_feat,
                     imag_action,
@@ -690,6 +733,20 @@ class ImagBehavior(nn.Module):
 
                 actor_loss -= self._config.actor["entropy"] * actor_ent[:-1, ..., None]
                 actor_loss = torch.mean(actor_loss)
+                '''
+                valid = mask[:-1]  # [L-1, N, 1]
+                loss_terms, mets = self._compute_actor_loss(
+                    imag_feat, imag_action, target, weights, base, jump_record_tensor,
+                )
+
+                # 逐元素遮罩 + 熵正则同样遮罩
+                loss_terms = loss_terms * valid
+                loss_terms -= self._config.actor["entropy"] * actor_ent[:-1, ..., None] * valid
+
+                # 只用“有效步”的数量做归一化
+                actor_loss = loss_terms.sum() / (valid.sum() + 1e-8)
+ #########
+
                 metrics.update(mets)
                 value_input = imag_feat
 
@@ -872,39 +929,98 @@ class ImagBehavior(nn.Module):
         else:
             return feats, states, actions
 
-    def _compute_target(self, imag_feat, imag_state, reward, jump_record, jumping_steps_predictor, accumulated_reward_predictor, is_end):
-        fc = torch.cat((imag_feat[:-1], imag_feat[1:]), dim=-1) # [L - 1, N, 2xx]
-        jumping_steps = jumping_steps_predictor(fc, None, None) # [L - 1, N, 1]
-        jumping_steps = torch.cat([jumping_steps, torch.zeros_like(jumping_steps[0]).unsqueeze(0)], dim=0) # [L, N, 1]
-        accumulated_reward = accumulated_reward_predictor(fc, None, None) # [L - 1, N, 1]
-        accumulated_reward = torch.cat([accumulated_reward, torch.zeros_like(accumulated_reward[0]).unsqueeze(0)], dim=0) # [L, N, 1]
-        accumulated_reward *= self.gamma_sum[(jumping_steps - 2).clamp(0, self._config.episode_max_steps - 1)]
-        
-        end = is_end(imag_state) # [L, N, 1]
-        gamma = self._config.discount * torch.ones_like(reward)
-        value = self.value(imag_feat).mode()
-        
-        jumping_steps = (jumping_steps - 1) * jump_record + 1
-        accumulated_reward *= jump_record
-        discount = gamma * (1.0 - end)
-        
+#######################修改原_jumpy代码，不成立
+    def _dynamic_jump_imagine(self, start, policy, horizon):
+        dynamics = self._world_model.dynamics
+        # rollout with jump
+        def step_jump(prev, _):
+            state, _, _ = prev
+            feat = dynamics.get_feat(state)
+            inp = feat.detach()
+            action = policy(inp).sample()
+            new_action = torch.zeros(action.shape[0], action.shape[1] + 1).to(action.device)
+            new_action[:, -1] = 1  # jump=1
+            next_state = dynamics.img_step(state, new_action)
+            return next_state, feat, action
+
+        feats_jump, states_jump, _ = tools.static_scan(step_jump, [torch.arange(horizon)], (start, None, None))
+        feat_jump = dynamics.get_feat(states_jump)
+        V_jump = self.value(feat_jump).mean(dim=0)  # shape: [B]
+
+        # rollout without jump
+        def step_nojump(prev, _):
+            state, _, _ = prev
+            feat = dynamics.get_feat(state)
+            inp = feat.detach()
+            action = policy(inp).sample()
+            new_action = torch.zeros(action.shape[0], action.shape[1] + 1).to(action.device)
+            new_action[:, -1] = 0  # jump=0
+            next_state = dynamics.img_step(state, new_action)
+            return next_state, feat, action
+
+        feats_nojump, states_nojump, _ = tools.static_scan(step_nojump, [torch.arange(horizon)], (start, None, None))
+        feat_nojump = dynamics.get_feat(states_nojump)
+        V_nojump = self.value(feat_nojump).mean(dim=0)
+        # compare value
+        jump_prob = torch.sigmoid(V_jump - V_nojump)
+        jump_decision = torch.rand_like(jump_prob) < jump_prob
+        # select trajectory
+        final_feats = torch.where(jump_decision.view(1, -1, 1), feats_jump, feats_nojump)
+        final_states = {k: torch.where(jump_decision.view(1, -1, *[1]*(v.dim()-2)), states_jump[k], states_nojump[k]) for k,v in states_jump.items}
+
+        return final_feats, final_states, jump_decision
+
+
+    #def _compute_target(self, imag_feat, imag_state, reward, jump_record, jumping_steps_predictor, accumulated_reward_predictor, is_end):
+    def _compute_target(self, imag_feat, imag_state, reward, jump_record,
+                    jumping_steps_predictor, accumulated_reward_predictor, is_end,
+                    mask, lengths):
+
+        # 1) 原有预测
+        fc = torch.cat((imag_feat[:-1], imag_feat[1:]), dim=-1)            # [L-1, N, ...]
+        jumping_steps = jumping_steps_predictor(fc, None, None)            # [L-1, N, 1]
+        accumulated_reward = accumulated_reward_predictor(fc, None, None)  # [L-1, N, 1]
+        jumping_steps = torch.cat([jumping_steps, jumping_steps.new_zeros(1, *jumping_steps.shape[1:])], dim=0)  # [L, N, 1]
+        accumulated_reward = torch.cat([accumulated_reward, accumulated_reward.new_zeros(1, *accumulated_reward.shape[1:])], dim=0)
+
+        # 2) 遮罩 + 跳跃项
+        end   = is_end(imag_state)                                          # [L, N, 1]
+        gamma = self._config.discount * torch.ones_like(reward)             # [L, N, 1]
+        value = self.value(imag_feat).mode()                                # [L, N, 1或K]
+
+        # 遮罩所有序列量
+        reward = reward * mask
+        gamma  = gamma  * mask
+        # 无效步视作“已终止”，避免继续向后滚
+        end    = torch.maximum(end, (1.0 - mask))
+
+        # 你的两项长程标签，只在 jump 步有效，同时受 mask 约束
+        jumping_steps      = ((jumping_steps - 1) * jump_record + 1) * mask
+        accumulated_reward = accumulated_reward * jump_record * mask
+
+        # 3) 逐样本 bootstrap：用每条轨迹的“最后有效步” value
+        last_idx = (lengths - 1).clamp(min=0)                               # [N]
+        D = value.shape[-1]
+        gidx = last_idx.view(1, -1, 1).expand(1, value.shape[1], D)         # [1, N, D]
+        bootstrap = value.gather(dim=0, index=gidx).squeeze(0)              # [N, D]
+
+        # 4) TD(λ) 目标（如果不想改该函数签名，已通过上面遮罩/伪终止处理兼容）
         target = tools.lambda_return_for_ls_imagine(
-            reward[1:],
-            value[:-1],
-            gamma[:-1],
-            end[:-1],
-            jumping_steps[:-1],
-            accumulated_reward[:-1],
-            bootstrap=value[-1],
+            reward[1:],                 # [L-1, N, 1]
+            value[:-1],                 # [L-1, N, 1]
+            gamma[:-1],                 # [L-1, N, 1]
+            end[:-1],                   # [L-1, N, 1]
+            jumping_steps[:-1],         # [L-1, N, 1]
+            accumulated_reward[:-1],    # [L-1, N, 1]
+            bootstrap=bootstrap,        # [N, 1] 逐样本 bootstrap
             lambda_=self._config.discount_lambda,
             axis=0,
         )
-        
-        self.save_state_sequence(imag_feat, jump_record)
-        
+
+        # 5) 训练权重也乘 mask
         weights = torch.cumprod(
-            torch.cat([torch.ones_like(discount[:1]), discount[:-1]], 0), 0
-        ).detach()
+            torch.cat([torch.ones_like(gamma[:1]), gamma[:-1]], 0), 0
+        ).detach() * mask
 
         return target, weights, value[:-1]
 
